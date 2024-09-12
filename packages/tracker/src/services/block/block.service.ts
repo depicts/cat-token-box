@@ -75,37 +75,44 @@ export class BlockService implements OnModuleInit {
   }
 
   private async processBlocks() {
-    // query last processed block in database
     const lastProcessedBlock = await this.getLastProcessedBlock();
-    // the potential next height to be processed is the height of last processed block plus one
-    // or the genesis block height if this is the first time run
-    const nextHeight = lastProcessedBlock
-      ? lastProcessedBlock.height + 1
-      : this.genesisBlockHeight;
-    // get block hash by height to check the existence of the next block
-    // if cannot get a result, then there is no new block to process
-    const nextHash = await this.getBlockHash(nextHeight);
-    if (!nextHash) {
-      await sleep(Constants.BLOCK_PROCESSING_INTERVAL);
-      return;
+    const nextHeight = lastProcessedBlock ? lastProcessedBlock.height + 1 : this.genesisBlockHeight;
+    const latestBlockHeight = (await this.getBlockchainInfo())?.headers;
+
+    if (latestBlockHeight && nextHeight < latestBlockHeight) {
+      // Initial catch-up phase
+      const batchSize = 100;
+      let currentHeight = nextHeight;
+      while (currentHeight <= latestBlockHeight) {
+        const batchHeaders = await this.getBatchBlockHeaders(currentHeight, batchSize);
+        for (const header of batchHeaders) {
+          await this.processBlock(header);
+        }
+        currentHeight += batchSize;
+      }
+    } else {
+      // Normal processing
+      const nextHash = await this.getBlockHash(nextHeight);
+      if (!nextHash) {
+        await sleep(Constants.BLOCK_PROCESSING_INTERVAL);
+        return;
+      }
+      const nextHeader = await this.processReorg(nextHash);
+      await this.processBlock(nextHeader);
     }
-    //                       lastProcessedBlock
-    //                          v
-    // database: [ ] -- [ ] -- [ ]
-    //                           \ -- [ ]
-    //                                 ^
-    //                              nextHash
-    //                             nextHeader
-    //
-    //                       lastProcessedBlock
-    //                          v
-    // database: [ ] -- [ ] -- [ ]
-    //            \
-    //             \ -- [ ] -- [ ] -- [ ]
-    //                   ^             ^
-    //               nextHeader     nextHash
-    const nextHeader = await this.processReorg(nextHash);
-    await this.processBlock(nextHeader);
+  }
+
+  private async getBatchBlockHeaders(startHeight: number, batchSize: number): Promise<BlockHeader[]> {
+    const headers: BlockHeader[] = [];
+    let currentHeight = startHeight;
+    for (let i = 0; i < batchSize; i++) {
+      const hash = await this.getBlockHash(currentHeight);
+      if (!hash) break;
+      const header = await this.getBlockHeader(hash);
+      headers.push(header);
+      currentHeight++;
+    }
+    return headers;
   }
 
   /**
@@ -148,20 +155,13 @@ export class BlockService implements OnModuleInit {
       throw new Error('no txs in block');
     }
     const before = Date.now();
-    // process all the block txs one by one in order
-    let catTxsCount = 0;
-    let catProcessingTime = 0;
-    for (let i = 0; i < block.transactions.length; i++) {
-      const ms = await this.txService.processTx(
-        block.transactions[i],
-        i,
-        blockHeader,
-      );
-      if (ms !== undefined) {
-        catTxsCount += 1;
-        catProcessingTime += ms;
-      }
-    }
+    // process all the block txs in parallel
+    const txPromises = block.transactions.map((tx, i) =>
+      this.txService.processTx(tx, i, blockHeader)
+    );
+    const txResults = await Promise.all(txPromises);
+    const catTxsCount = txResults.filter((ms) => ms !== undefined).length;
+    const catProcessingTime = txResults.reduce((sum, ms) => sum + (ms || 0), 0);
     // save block
     await this.blockEntityRepository.save({
       ...blockHeader,
